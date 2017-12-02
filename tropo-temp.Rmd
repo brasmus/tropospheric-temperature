@@ -1,0 +1,270 @@
+---
+title: "tropospheric-temperature"
+author: "Rasmus E Benestad"
+date: "April 14, 2017"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Evaluation of tropospheric temperatures 
+
+This script compares tropospheric temperatures (TLT) simulated from gloal climate models (CMIP5) and data from satellites (MSU). When comparing model results to data derived from satellites, there are a number of issues to keep in mind. The satellite data provide a measure of the air teperature over a range of altitudes, and are also affected by the surface temperatures. Different vertical weights are used for data over ocean and land, respectively. To process the model results to mimic what really was observed by the sattelites, we need to apply these weights correctly.
+
+The model results used here were only the zonal means, which makes it impossible to derive the exact results. However, it is possible to estiamte the fraction with land and fraction with ocean, and use a combined vertical weighting function with approporaite weight on land and ocean. 
+
+The global climate models (GCMs) provide results in the form of grid boxes, with latitude along one axis and pressure-level (vertical) along the other. The area of a latitude band near tthe equator is larger than a latitude band of the same width at higher latitude, due to earth's curvature (spherical shape). Hence, the global and tropical mean TLT must take into account the latitude-variable area and weight the model results accordingly.
+
+Another issue is that different GCMs operate with different calendars, e.g. the Gregorian (which is used in the real world), 365-day calendar (no leap-year), and 360-day calendar. If this is not taken into account, the months in the future will end up in the wrong season.   
+
+
+### R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+
+```{r}
+library(esd)
+```
+
+## CMIP5 simulations
+
+
+## Vertical weigthing functions
+
+The GCM results are stored in a 4D grid with the dimensions longitude, latitude, vertical levels, and time, whereas the satellite microwave sounding unit (MSU) data measure temperatures over different altitudes. Any comparison between these two aspects requires some data processing before we get comparable measures. THe MSU data are equivalent to a vertical-weighted average temperature. 
+
+Retrieve the weighting loads for the different heights corresponding to the TLT temperature. More on the vertical weighting function from <http://www.remss.com/measurements/upper-air-temperature> and <http://tropic.ssec.wisc.edu/real-time/amsu/explanation.html>. 
+
+
+```{r}
+if (!file.exists('tlt.W.rda')) {
+  colnames <- c('level','h(m)','T(K)','P(pa)','PV(pa)','Weight')
+  ## Weighting over land:
+  ## Surface Weight                                  0.15104
+  tlt.wl <- read.table('http://data.remss.com/msu/weighting_functions/std_atmosphere_wt_function_chan_tlt_land.txt',skip=7,
+                 col.names = colnames)
+  attr(tlt.wl,'Surface Weight') <- 0.15104
+  ## Weighting over ocean
+  ## Surface Weight                                  0.11863
+  tlt.wo <- read.table('http://data.remss.com/msu/weighting_functions/std_atmosphere_wt_function_chan_tlt_ocean.txt',skip=7,
+                 col.names=colnames)
+  attr(tlt.wo,'Surface Weight') <- 0.11863
+  tlt.W <- list(tlt.wl=tlt.wl,tlt.wo=tlt.wo)
+  save(tlt.W,file='tlt.W.rda')
+} else load('tlt.W.rda')
+```
+
+A small test to see whether the vertical weights look right and to see the difference in the weights over land and ocean.
+
+```{r}
+plot(tlt.W$tlt.wo$Weight,tlt.W$tlt.wo$h.m.,type='l',lwd=2,col='grey')
+lines(tlt.W$tlt.wl$Weight,tlt.W$tlt.wl$h.m.,col='red',lty=2)
+grid()
+```
+
+The two weights differ most near the surface. 
+
+### Functions extracting the TLT 
+
+The following R-code describe a set of functions used for processing the GCM results to make them more comparable with the MSU data.
+
+
+#### Global and tropical means.
+
+The air temperature also needs to be weighted according to surface area (latitude) and height before it is aggregated to a product that is comparable to that of the satellite TLT.
+
+```{r}
+## Estimate area weighted mean temperature 
+areamean <- function(x,W.lat,d) {
+  y <- x*c(W.lat)
+  dim(y) <- c(d[1],d[2])
+  z <- colSums(y,na.rm=TRUE)/sum(W.lat[,1],na.rm=TRUE)
+  return(z)
+}
+
+ta2tlt <- function(fname,tlt.W,xlat=c(-90,90),varid='ta') {
+  require(ncdf4)
+  ncid <- nc_open(fname)
+  X <- ncvar_get(ncid,varid)
+  lat <- ncvar_get(ncid,'lat')
+  plev <- ncvar_get(ncid,'plev')
+  tim <- ncvar_get(ncid,'time')
+  tunit <- ncatt_get(ncid,'time','units')
+  model.id <- ncatt_get(ncid,0,'model_id')
+  rcp <- ncatt_get(ncid,0,'experiment')
+  ## Different GCMs use different calendars: 365-day, Gregorian, ets.
+  calendar <- ncatt_get(ncid,'time','calendar')
+  nc_close(ncid)
+  ## Extract selected latitude band
+  iy <- (lat >= min(xlat)) & (lat <= max(xlat))
+  lat <- lat[iy]
+  X <- X[iy,,]
+  d <- dim(X)
+  
+  ## Area weights - latitude
+  W.lat <- matrix(rep(cos(pi*lat/180),d[2]),d[1],d[2])
+  ## Prepare for fast matrix operations
+  dim(X) <- c(d[1]*d[2],d[3])
+  ## Z contains the global mean temperature at different vertical levels
+  Z <- apply(X,2,'areamean',W.lat,d)
+  
+  ## Estimate the TLT-temperature based on the TLT weights
+  data(etopo5)
+  etopo5 <- subset(etopo5,is=list(lat=xlat))
+  ## Weighted average of land and ocean
+  nl <- sum(etopo5 >=0)/length(etopo5); no <- sum(etopo5 <0)/length(etopo5)
+  W0 <- no*tlt.W$tlt.wo$Weight + nl*tlt.W$tlt.wl$Weight
+  W <- approx(tlt.W$tlt.wo$P.pa.,W0,plev,rule=2)$y
+  
+  tlt <- apply(Z,2,function(x,W) sum(x*W,na.rm=TRUE)/sum(W,na.rm=TRUE),W)
+  
+  ## Use the first time stamp and the time orgigin to set the first date, and then
+  ## Assume every month since that (there are monthly mean data after all)
+  t1 <- as.Date(tim[1],origin = sub('days since ','',tunit$value))
+  TLT <- zoo(tlt, order.by=seq(t1,by='month',length.out=length(tim)))
+  attr(TLT,'model_id') <- model.id
+  attr(TLT,'rcp') <- rcp
+  if (sum(is.finite(tlt))==0) browser()
+  return(TLT)
+}
+```
+
+## Retrieveing and processing the GCM data
+
+Download CMIP5 data from the KNMI Climate Explorer and estimate the TLT temperature. The data is stored as zonal mean temperature with the dimensions latitude and pressure-level.
+
+```{r pressure, echo=FALSE}
+N <- 102  ## Number of model runs with taz available at ClimateExplorer
+if (!file.exists('tlt.cmip5.rda')) {
+  model.id <- rep('',N); rcp <- model.id
+  for (i in 1:N) {
+   if (i <= 10)  fname <- paste('taz_Amon_one_rcp45to85_00',i-1,'.nc',sep='') else
+   if (i <= 100) fname <- paste('taz_Amon_one_rcp45to85_0',i-1,'.nc',sep='') else
+                 fname <- paste('taz_Amon_one_rcp45to85_',i-1,'.nc',sep='')
+   print(fname)
+   if (!file.exists(fname)) 
+     download.file(paste('https://climexp.knmi.nl/CMIP5/monthly/taz/',fname,sep=''),destfile = fname)
+   tlt.glob <- ta2tlt(fname,tlt.W,xlat=c(-70,82.5),varid='ta')  ## These match RSS
+   tlt.trop <- ta2tlt(fname,tlt.W,xlat=c(-25,25),varid='ta')    ## These match RSS
+   model.id[i] <- attr(tlt.glob,'model_id')
+   rcp[i] <- attr(tlt.glob,'rcp')
+   if (i==1) {
+     TLT.glob <- tlt.glob; TLT.trop <- tlt.trop
+   } else {
+     TLT.glob <- merge(TLT.glob,tlt.glob)
+     TLT.trop <- merge(TLT.trop,tlt.trop)
+   }
+  }
+  
+  tlt.cmip5 <- list(TLT.glob=TLT.glob,TLT.trop=TLT.trop)
+  attr(tlt.cmip5,'model_id') <- model.id
+  attr(tlt.cmip5,'rcp') <- rcp
+  save(tlt.cmip5,file='tlt.cmip5.rda')
+} else load('tlt.cmip5.rda')
+plot(annual(anomaly(tlt.cmip5$TLT.glob)),plot.type='single',col=rgb(0,0,0,0.2))
+```
+
+## Data from satellites 
+
+### Get the lower tropospheric data from the RSS:
+
+```{r}
+if (!file.exists('RSS.glob.rda')) {
+  rss.glob <- read.table('http://data.remss.com/msu/graphics/TLT/time_series/RSS_TS_channel_TLT_Global_Land_And_Sea_v03_3.txt',skip=5)
+  rss.trop <- read.table('http://data.remss.com/msu/graphics/TLT/time_series/RSS_TS_channel_TLT_Tropics_Land_And_Sea_v03_3.txt',skip=5)
+  rss.glob$V3[rss.glob$V3 <= -99] <- NA
+  RSS.glob <- zoo(rss.glob$V3,order.by=as.Date(paste(rss.glob$V1,rss.glob$V2,'01',sep='-')))
+  rss.trop$V3[rss.trop$V3 <= -99] <- NA
+  RSS.trop <- zoo(rss.trop$V3,order.by=as.Date(paste(rss.trop$V1,rss.trop$V2,'01',sep='-')))
+  save(RSS.glob,file='RSS.glob.rda')
+  save(RSS.trop,file='RSS.trop.rda')
+} else {load('RSS.glob.rda'); load('RSS.trop.rda')}
+```
+
+### Get the lower tropospheric data from University of Alabama Huntsville
+
+```{r}
+if (!file.exists('UAH.glob.rda')) {
+  UAH <- readLines('http://www.nsstc.uah.edu/data/msu/t2lt/tltglhmam_5.6.txt')
+  writeLines(UAH[-length(UAH)],con='UAHTLT.dat')
+  uah <- read.table('UAHTLT.dat',skip=4,header=TRUE)
+  UAH.glob <- zoo(uah$GLOBAL,order.by=as.Date(paste(uah$YEAR,uah$MON,'01',sep='-')))
+  UAH.trop <- zoo(uah$TRPC,order.by=as.Date(paste(uah$YEAR,uah$MON,'01',sep='-')))
+  save(UAH.glob,file='UAH.glob.rda')
+  save(UAH.trop,file='UAH.trop.rda')
+} else {load('UAH.glob.rda'); load('UAH.trop.rda')}
+```
+
+The data are svaed locally so that they can be accessed even with no Internet.
+
+## Compare the data
+
+### The global mean TLT temperature
+
+```{r}
+X <- merge(annual(anomaly(RSS.glob,ref=1979:1990)),
+           annual(anomaly(UAH.glob,ref=1979:1990)),
+           annual(anomaly(window(tlt.cmip5$TLT.glob,start=start(RSS.glob),end=end(RSS.glob)),ref=1979:1990)))
+par(bty='n')
+plot(X[,-c(1,2)],plot.type='single',col=rep(rgb(0,0,0,0.15),N),main='Global lower Tropospheric Temperature (TLT)',ylab='Temperature')
+grid()
+lines(X[,1],lwd=3,col='red')
+lines(X[,2],lwd=3,col='blue')
+legend(1979,1.5,c('CMIP5','RSS','UAH'),col=c(rgb(0,0,0,0.15),'red','blue'),bty='n',lwd=c(1,3,3))
+```
+
+A comparison between the MSU data and the GCM results (CMIP5) suggests that the GCMs somewhat over-estimate the recent warming, but the satellite data are nevertheless within the spread of the model ensemble. These results suggests that there is a fair agreement between the two. 
+
+### The global mean TLT temperature
+
+```{r}
+X <- merge(annual(anomaly(RSS.trop,ref=1979:1990)),
+           annual(anomaly(UAH.trop,ref=1979:1990)),
+           annual(anomaly(window(tlt.cmip5$TLT.trop,start=start(RSS.trop),end=end(RSS.trop)),ref=1979:1990)))
+par(bty='n')
+plot(X[,-c(1,2)],plot.type='single',col=rep(rgb(0,0,0,0.15),N),main='Tropical lower Tropospheric Temperature (TLT)',ylab='Temperature')
+grid()
+lines(X[,1],lwd=3,col='red')
+lines(X[,2],lwd=3,col='blue')
+legend(1979,1.5,c('CMIP5','RSS','UAH'),col=c(rgb(0,0,0,0.15),'red','blue'),bty='n',lwd=c(1,3,3))
+```
+
+for the tropical region, the GCM results are still consistent with the satellite data, but the latter is further out on the fridge of the model spread.
+
+### Global trend analysis
+
+```{r}
+z <- apply(coredata(annual(anomaly(window(tlt.cmip5$TLT.glob,start=start(RSS.glob),end=end(RSS.glob)),ref=1979:1990))),2,trend.coef)
+h <- hist(z,col='grey',freq=FALSE,main='',ylab='',
+          xlab='Trend (K/decade)')
+x <- seq(-max(abs(z)),max(abs(z)),length=100)
+lines(x,dnorm(x,mean=mean(z),sd=sd(z)),lwd=3,col=rgb(1,0,0,0.4))
+points(trend.coef(annual(anomaly(RSS.glob,ref=1979:1990))),0,pch=19,cex=2,col='red')
+points(trend.coef(annual(anomaly(UAH.glob,ref=1979:1990))),0,pch=19,cex=2,col='blue')
+grid()
+par(new=TRUE,fig=c(0.75,0.98,0.75,0.98),mar=rep(0,4),cex.axis=0.7)
+qqnorm(z,main=''); qqline(z,col='red')
+```
+
+A comparison of the global linear trend estiamtes (based on a least-squares fit to a linear function in time) suggests that the satellite data are well within the model results and the fitted normal distribution. The sample of model results are roughly normally distributed except for the lower part of the spread (the "lower tail"" of the distribution).
+
+
+### Tropics trend analysis
+
+```{r}
+z <- apply(coredata(annual(anomaly(window(tlt.cmip5$TLT.trop,start=start(RSS.trop),end=end(RSS.trop)),ref=1979:1990))),2,trend.coef)
+h <- hist(z,col='grey',freq=FALSE,main='',ylab='',
+          xlab='Trend (K/decade)')
+x <- seq(-max(abs(z)),max(abs(z)),length=100)
+lines(x,dnorm(x,mean=mean(z),sd=sd(z)),lwd=3,col=rgb(1,0,0,0.4))
+points(trend.coef(annual(anomaly(RSS.trop,ref=1979:1990))),0,pch=19,cex=2,col='red')
+points(trend.coef(annual(anomaly(UAH.trop,ref=1979:1990))),0,pch=19,cex=2,col='blue')
+grid()
+par(new=TRUE,fig=c(0.75,0.98,0.75,0.98),mar=rep(0,4),cex.axis=0.7)
+qqnorm(z,main=''); qqline(z,col='red')
+```
+
+A comparison of the tropical trends also suggests that the satellite data are within the model results and the fitted normal distribution, but further out on the fringe compared to the global trends. 
